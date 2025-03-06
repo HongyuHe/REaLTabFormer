@@ -616,6 +616,7 @@ class TabularSampler(REaLSampler):
 
         if seed_input is None:
             generated = torch.tensor(
+                #* Insert beginning of sentence token
                 [self.vocab["token2id"][SpecialTokens.BOS] for _ in range(1)]
             ).unsqueeze(0)
         else:
@@ -623,6 +624,8 @@ class TabularSampler(REaLSampler):
 
         generated = generated.to(self.model.device)
 
+        #! `n_samples` is NOT a hard limit. The actual number samples is not enforeced and
+        #! can exceed this specified value.
         with tqdm(total=n_samples) as pbar:
             pbar_num_gen = 0
             num_generated = 0
@@ -645,6 +648,7 @@ class TabularSampler(REaLSampler):
                     forced_decoder_ids=forced_decoder_ids,
                     **generate_kwargs,
                 )
+                #TODO: Insert rule-compliance check here.
 
                 self.total_gen_samples += len(sample_outputs)
                 self.invalid_gen_samples += len(sample_outputs)

@@ -110,8 +110,10 @@ def build_vocab(df: pd.DataFrame = None, special_tokens=None, add_columns: bool 
 
     if df is not None:
         for col in df.columns:
+            #* The tokens are full words/categories in a column!
             id2token.update(dict(enumerate(sorted(df[col].unique()), curr_id)))
             column_token_ids[col] = list(range(curr_id, max(id2token) + 1))
+            #* Token IDs are accumulated across columns, so there's a single vocab.
             curr_id = max(id2token) + 1
 
         if add_columns:
