@@ -1,12 +1,14 @@
 """This module contains the implementation for the sampling
 algorithms used for tabular and relational data generation.
 """
+import json
 import logging
 import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import datasets
 import numpy as np
+import sympy as sp
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -27,6 +29,7 @@ from .data_utils import (
     is_numeric_datetime_col,
     make_dataset,
     process_data,
+    to_big_camelcase,
 )
 from .rtf_exceptions import SampleEmptyError, SampleEmptyLimitError
 from .rtf_validators import ObservationValidator
@@ -620,9 +623,22 @@ class TabularSampler(REaLSampler):
                 [self.vocab["token2id"][SpecialTokens.BOS] for _ in range(1)]
             ).unsqueeze(0)
         else:
+            #? Not sure what this is for.
             generated = self._process_seed_input(seed_input=seed_input)
 
         generated = generated.to(self.model.device)
+        
+        #* Load rules
+        rules: List[sp.Expr] = []
+        path = "rules/cidds/learned_cicids_8192_checked.pl"
+        with open(f"{path}", 'r') as f:
+            for i, line in enumerate(f):
+                expr: sp.Expr = sp.sympify(line.strip())
+                rules.append(expr)
+                print(f"Loaded # of rules:\t{i+1}", end='\r')
+        print(f"Loaded # of rules:\t{i+1}")
+        #TODO: move to device or load the generated outputs to back to cpu for checking and then back to device?
+        rules = torch.tensor(rules).to(device)
 
         #! `n_samples` is NOT a hard limit. The actual number samples is not enforeced and
         #! can exceed this specified value.
@@ -648,17 +664,32 @@ class TabularSampler(REaLSampler):
                     forced_decoder_ids=forced_decoder_ids,
                     **generate_kwargs,
                 )
-                #TODO: Insert rule-compliance check here.
 
                 self.total_gen_samples += len(sample_outputs)
                 self.invalid_gen_samples += len(sample_outputs)
 
+                #? Are the following operations happening on the device?
                 try:
-                    synth_sample = self._processes_sample(
+                    synth_sample: pd.DataFrame = self._processes_sample(
                         sample_outputs=sample_outputs,
                         vocab=self.vocab,
                         validator=validator,
                     )
+                    
+                    #* Rule-compliance check.
+                    violated_rules = []
+                    for rule in rules:
+                        for i, sample in synth_sample.iterrows():
+                            assignment = {}
+                            for key in sample.keys():
+                                var = to_big_camelcase(key)
+                                assignment[var] = sample[key]
+                            sat = rule.subs(assignment)
+                            if not sat:
+                                violated_rules.append(i)
+                    
+                    synth_sample = synth_sample.drop(violated_rules)       
+                    
                     empty_limit = continuous_empty_limit
                     self.invalid_gen_samples -= len(synth_sample)
 

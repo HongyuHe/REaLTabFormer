@@ -17,6 +17,11 @@ NUMERIC_NA_TOKEN = "@"
 INVALID_NUMS_RE = r"[^\-.0-9]"
 
 
+def to_big_camelcase(string: str, sep=' ') -> str:
+    words = string.split(sep)
+    return ''.join(word.capitalize() for word in words) \
+        if len(words) > 1 else string.capitalize()
+
 @dataclass(frozen=True)
 class TabularArtefact:
     best_disc_model: str = "best-disc-model"
