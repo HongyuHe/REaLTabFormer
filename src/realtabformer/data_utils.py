@@ -6,6 +6,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, fields
 from typing import Dict, List, Optional, Tuple
+from bidict import bidict
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,68 @@ TEACHER_FORCING_PRE = "_TEACHERFORCING"
 SPECIAL_COL_SEP = "___"
 NUMERIC_NA_TOKEN = "@"
 INVALID_NUMS_RE = r"[^\-.0-9]"
+
+#******************** CIDDS-001 Domain Knowledge begins ********************
+#? Should port be a categorical variable? Sometimes we need range values (i.e., application and dynamic ports).
+cidds_categorical = ['Flags', 'Proto', 'SrcIpAddr', 'DstIpAddr'] + ['SrcPt', 'DstPt']
+cidds_numerical = ['Packets', 'Bytes', 'Flows', 'Duration']
+cidds_ips = ['private_p2p', 'private_broadcast', 'private_any', 'public_p2p', 'dns']
+cidds_ports = [0, 3, 8, 11, 22, 25, 
+            #    23, #* Telnet
+            #    8000, #* Seafile Server
+               53, 67, 68, 80, 123, 137, 138, 443, 8080]
+
+#* Map strings to integers
+cidds_ip_conversion = bidict({ip: i for i, ip in enumerate(cidds_ips)})
+cidds_flags_conversion = bidict({flag: i for i, flag in enumerate(['noflags', 'flags'])})
+#TODO: Change the mapping to standard NetFlow codes: 
+# https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+cidds_proto_conversion = bidict({proto: i for i, proto in enumerate(['TCP', 'UDP', 'ICMP', 'IGMP'])})
+cidds_conversions = {
+    'ip': cidds_ip_conversion,
+    'flags': cidds_flags_conversion,
+    'proto': cidds_proto_conversion
+}
+cidds_constants = {
+	'ip': list(cidds_conversions['ip'].values()),
+	'port': cidds_ports,
+	'packet': [42, 64, 65_535], #* MTU
+    'bytes': [1],
+}
+
+def cidds_proto_map(proto: str):
+	return cidds_proto_conversion[proto]
+
+def cidds_ip_map(ip: str):
+    new_ip = ''
+    if ip.startswith('192.168.'):
+        new_ip += 'private_'
+    else:        
+        new_ip += 'public_'
+    if '.255' in ip:
+        new_ip += 'broadcast'
+    else:
+        new_ip += 'p2p'
+    
+    if ip == '0.0.0.0':
+        new_ip = 'private_any'
+    elif ip == '255.255.255.255':
+        new_ip = 'private_broadcast'
+    elif ip == 'DNS':
+        new_ip = 'dns'
+    
+    return cidds_ip_conversion[new_ip]
+
+def cidds_flag_map(flag: str):
+	#! Don't consider the specific 'Flags' values for now
+    new_flag = ''
+    if flag == '......':
+        new_flag = 'noflags'
+    else:
+        new_flag = 'flags'
+    
+    return cidds_flags_conversion[new_flag]
+#******************** CIDDS-001 Domain Knowledge ends ********************
 
 
 def to_big_camelcase(string: str, sep=' ') -> str:
@@ -169,7 +232,7 @@ def process_numeric_data(
     # pd.Int64Dtype but just to be very sure, let's do that again here.
     try:
         series = series.astype(pd.Int64Dtype())
-    except TypeError:
+    except TypeError: #* `TypeError: cannot safely cast non-equivalent object to int64`
         pass
     except ValueError:
         pass
@@ -194,6 +257,7 @@ def process_numeric_data(
         mx_sig = transform_data["mx_sig"]
     else:
         mx_sig = series.str.find(".").max()
+        #* `mx_sig` is largest #digits before the decimal point.
         transform_data["mx_sig"] = int(mx_sig)
 
     if mx_sig <= 0:
@@ -208,6 +272,7 @@ def process_numeric_data(
         else:
             zfill = series.map(len).max()
             transform_data["zfill"] = int(zfill)
+        #* Integers are left-aligned to `zfill` #digits with leading zeros.
         series = series.str.zfill(zfill)
     else:
         # Make sure that we don't exessively truncate the data.
@@ -239,6 +304,8 @@ def process_numeric_data(
             ljust = series.map(len).max()
             transform_data["ljust"] = int(ljust)
 
+        #* `ljust` is the total #digits + the decimal point.
+        #* Number of fractional digits = `ljust` - `mx_sig` - 1
         series = series.str.ljust(ljust, "0")
 
     # If a number has a negative sign, make sure that it is placed properly.

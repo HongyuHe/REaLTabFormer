@@ -35,6 +35,7 @@ from transformers.models.gpt2 import GPT2Config, GPT2LMHeadModel
 import realtabformer
 
 from .data_utils import (
+    SPECIAL_COL_SEP,
     ModelFileName,
     ModelType,
     SpecialTokens,
@@ -1152,6 +1153,8 @@ class REaLTabFormer:
     def sample(
         self,
         n_samples: int = None,
+        check_rules: bool = False,
+        dataset: str = 'cidds',
         input_unique_ids: Optional[Union[pd.Series, List]] = None,
         input_df: Optional[pd.DataFrame] = None,
         input_ids: Optional[torch.tensor] = None,
@@ -1223,7 +1226,7 @@ class REaLTabFormer:
             assert self.col_transform_data is not None
 
             tabular_sampler = TabularSampler.sampler_from_model(
-                rtf_model=self, device=device
+                rtf_model=self, dataset=dataset, device=device
             )
             # (
             #     model_type=self.model_type,
@@ -1243,6 +1246,7 @@ class REaLTabFormer:
             # )
             synth_df = tabular_sampler.sample_tabular(
                 n_samples=n_samples,
+                check_rules=check_rules,
                 gen_batch=gen_batch,
                 device=device,
                 seed_input=seed_input,

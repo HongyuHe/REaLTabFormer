@@ -1,55 +1,35 @@
 """This module contains the implementation for the sampling
 algorithms used for tabular and relational data generation.
 """
-from __future__ import annotations
-from time import perf_counter
-from typing import *
-
-if TYPE_CHECKING:
-    from .realtabformer import REaLTabFormer
-    
-import json
-from functools import cache
-from collections import OrderedDict
-import z3
-from rich.pretty import pprint
-from IPython.display import display
 import logging
 import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import datasets
 import numpy as np
-import sympy as sp
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import DefaultDataCollator, PreTrainedModel
 
-from .data_utils import *
-# (
-#     INVALID_NUMS_RE,
-#     NUMERIC_NA_TOKEN,
-#     ModelType,
-#     SpecialTokens,
-#     decode_column_values,
-#     decode_partition_numeric_col,
-#     decode_processed_column,
-#     fix_multi_decimal,
-#     is_datetime_col,
-#     is_numeric_col,
-#     is_numeric_datetime_col,
-#     make_dataset,
-#     process_data,
-#     to_big_camelcase,
-# )
+from .data_utils import (
+    INVALID_NUMS_RE,
+    NUMERIC_NA_TOKEN,
+    ModelType,
+    SpecialTokens,
+    decode_column_values,
+    decode_partition_numeric_col,
+    decode_processed_column,
+    fix_multi_decimal,
+    is_datetime_col,
+    is_numeric_col,
+    is_numeric_datetime_col,
+    make_dataset,
+    process_data,
+)
 from .rtf_exceptions import SampleEmptyError, SampleEmptyLimitError
 from .rtf_validators import ObservationValidator
-from .anuta_utils import *
-from .anuta_known import *
-import anuta
-from anuta.constructor import Cidds001, Cicids2017
 
 NQ_COL = "_nq_ds_"
 
@@ -240,7 +220,6 @@ class REaLSampler:
         self.model.eval()
 
         if constrain_tokens_gen:
-            #TODO: This might be the place to constrain the allowed next tokens?
             generate_kwargs["prefix_allowed_tokens_fn"] = self._prefix_allowed_tokens_fn
 
         vocab = (
@@ -252,8 +231,6 @@ class REaLSampler:
         # Make sure that the [RMASK] token will never be generated.
         RMASK_ID = vocab["token2id"][SpecialTokens.RMASK]
         if generate_kwargs["suppress_tokens"] is None:
-            #TODO: Or here? // "A list of tokens that will be supressed at generation. The SupressTokens logit processor will set their log probs to -inf so that they are not sampled."
-            #? Will the distribution be normalized?
             generate_kwargs["suppress_tokens"] = [RMASK_ID]
         else:
             generate_kwargs["suppress_tokens"].append(RMASK_ID)
@@ -353,7 +330,7 @@ class REaLSampler:
                         # can later be implemented to remove these.
                         group_series = (
                             group_series.str.replace("[^0-9]", "", regex=True)
-                            .map(lambda x: int(x) if x else None)
+                            .map(lambda x: int(x) if x == x else None)
                             .fillna(pd.NA)
                         )
                     else:
@@ -523,11 +500,6 @@ class TabularSampler(REaLSampler):
         drop_na_cols: List,
         col_transform_data: Dict,
         random_state: Optional[int] = 1029,
-        col_start_pos: Optional[List[int]] = None,
-        relevant_rules: Optional[Dict[str, List[z3.ExprRef]]] = None,
-        constructor: Optional[anuta.constructor.Constructor ] = None,
-        evalmap: Optional[Dict[str, z3.ExprRef]] = None,
-        col_ignore: Optional[List[int]] = None,
         device="cuda",
     ) -> None:
         super().__init__(
@@ -549,184 +521,14 @@ class TabularSampler(REaLSampler):
         )
 
         self.output_vocab = self.vocab
-        #* Start indexes of original columns from processed columns
-        self.col_start_pos = col_start_pos
-        self.relevant_rules = relevant_rules
-        self.prefix_rules = []
-        self._generation_cache = {}
-        self.constructor = constructor
-        self.evalmap = evalmap
-        self._numeric_gen = {}
-        self.col_ignore = col_ignore
-        self.num_invalid_tokens = 0
-        self._sample_validities: List[bool] = []
 
     @staticmethod
-    def sampler_from_model(rtf_model: 'REaLTabFormer', dataset: str='cidds', device: str = "cuda"):
+    def sampler_from_model(rtf_model, dataset='', device: str = "cuda"):
         device = torch.device(device)
 
         assert rtf_model.tabular_max_length is not None
         assert rtf_model.tabular_col_size is not None
         assert rtf_model.col_transform_data is not None
-        
-        #& Extract the start positions of the original columns from the mangled column names.
-        processed_cols = rtf_model.vocab['column_token_ids'].keys()
-        col_start_pos = []
-        cur_col = None
-        for i, col in enumerate(processed_cols):
-            col = col.split('___')[-1]
-            col = ''.join(col.split('_')[:-1]) if '_' in col else col
-            if col != cur_col:
-                col_start_pos.append(i)
-                cur_col = col
-        #* Include the end position + 1 in order to generate the last column (its previous col).
-        col_start_pos.append(len(processed_cols))
-        # assert len(col_start_pos) == len(rtf_model.columns)+1, f"{len(col_start_pos)=} ≠ {len(rtf_model.columns)=}"
-        print(f"{col_start_pos=}")
-        
-        #& Populate prefix rules.
-        rulepath = ''
-        evalmap = z3evalmap
-        constructor = None
-        col_todrop = []
-        col_ignore = []
-        match dataset:
-            case 'cidds':
-                rulepath = "/home/hh1789/Projects/REaLTabFormer/rules/learned_cidds_8192_checked.pl"
-                datapath = "/scratch/gpfs/hh1789/data/cidds_wk3_all.csv"
-                constructor = Cidds001(datapath)
-                col_todrop = ['Flows']
-                for col in col_todrop:
-                    if col in rtf_model.columns:
-                        col_ignore.append(rtf_model.columns.index(col))
-                        # rtf_model.columns.remove(col)
-            case 'cicids':
-                rulepath = "/home/hh1789/Projects/REaLTabFormer/rules/learned_cicids_8192_checked.pl"
-                datapath = "/scratch/gpfs/hh1789/data/cicids_monday_all.csv"
-                constructor = Cicids2017(datapath)
-                col_todrop = ['Down_Up_Ratio', 'Average_Packet_Size', 'Avg_Fwd_Segment_Size', 'Avg_Bwd_Segment_Size', 
-                           'Fwd_Avg_Bytes_Bulk', 'Fwd_Avg_Packets_Bulk', 'Fwd_Avg_Bulk_Rate', 'Bwd_Avg_Bytes_Bulk', 
-                           'Bwd_Avg_Packets_Bulk', 'Bwd_Avg_Bulk_Rate', 'Subflow_Fwd_Packets', 'Subflow_Fwd_Bytes', 
-                           'Subflow_Bwd_Packets', 'Subflow_Bwd_Bytes', 'Init_Win_bytes_fwd', 'Init_Win_bytes_bwd', 
-                           'act_data_pkt_fwd', 'min_seg_size_fwd', 'Source_Port', 'Destination_Port', ]
-                for col in col_todrop:
-                    if col in rtf_model.columns:
-                        col_ignore.append(rtf_model.columns.index(col))
-                        # rtf_model.columns.remove(col)
-            case _:
-                raise ValueError(f"Unknown dataset: {dataset}")
-        rules_sp = []
-        with open(f"{rulepath}", 'r') as f:
-            for i, line in enumerate(f):
-                expr: sp.Expr = sp.sympify(line.strip())
-                rules_sp.append(expr)
-                print(f"Loaded # of rules:\t{i+1}", end='\r')
-        
-        #* First, complete the evalmap for sp to z3 conversion.
-        for col in rtf_model.columns:
-            varname = to_big_camelcase(col) if dataset == 'cidds' else to_big_camelcase(col, '_')
-            match dataset:
-                case 'cidds':
-                    #* Update the evalmap with vars.
-                    if varname in cidds_ints:
-                        evalmap[varname] = z3.Int(varname)
-                    elif varname in cidds_reals:
-                        evalmap[varname] = z3.Real(varname)
-                case 'cicids':
-                    if varname in constructor.anuta.domains:
-                        domain = constructor.anuta.domains[varname]
-                        if varname == 'Protocol':
-                            evalmap[varname] = z3.Int(varname)
-                        elif type(domain.bounds.lb)==float or type(domain.bounds.ub)==float:
-                            evalmap[varname] = z3.Real(varname)
-                        else:
-                            evalmap[varname] = z3.Int(varname)
-        
-        relevant_rules = defaultdict(list)
-        for i, col in enumerate(rtf_model.columns):
-            relevant = []
-            filtered_relevant = []
-            varname = to_big_camelcase(col) if dataset == 'cidds' else to_big_camelcase(col, '_')
-            prefix_vars = set(sp.symbols([to_big_camelcase(name) for name in rtf_model.columns[: i]]))\
-                if dataset == 'cidds' else \
-                    set(sp.symbols([to_big_camelcase(name, '_') for name in rtf_model.columns[: i]]))
-            
-            cur_var = sp.symbols(varname)
-            included_vars = prefix_vars | {cur_var}
-            for rule in rules_sp:
-                variables = rule.free_symbols
-                num_vars = len(variables)
-                
-                #& All connected rules.
-                if len(variables & included_vars) > 0:
-                    relevant.append(rule)
-                    #* Accumulate vars from included rules.
-                    included_vars |= variables
-                
-                # #& Related rules.
-                # if len(variables & (prefix_vars | {cur_var})) > 0:
-                #     #* As long as the rule contains ≥1 variable from the current and/or one of the prefix vars.
-                #     relevant.append(rule)
-
-                # #& Prefix rules only.
-                # if cur_var in variables and len(variables & (prefix_vars | {cur_var})) == num_vars:
-                #     #* rule has to contain current var AND the rest of vars are all prefixes
-                #     relevant.append(rule)
-            print(f"Found {len(relevant)} relevant rules for {varname}.")
-            
-            #* Filter redundant rules
-            for rule in relevant:
-                if isinstance(rule, sp.Implies):
-                    precedent, consequent = rule.args
-                    if isinstance(precedent, sp.And):
-                        p1, p2 = precedent.args
-                        # pprint(rule)
-                        # pprint([p1.free_symbols, p2.free_symbols])
-                        if p1.free_symbols == p2.free_symbols:
-                            # pprint(rule)
-                            continue
-                filtered_relevant.append(rule)
-            filtered_relevant = sorted(filtered_relevant, key=lambda r: str(r))
-            # print(f"Filtered to {len(filtered_relevant)} relevant rules for {varname}.")
-            
-            coalesced_rules = coalesce(filtered_relevant)
-            print(f"Coalesced to {len(coalesced_rules)} rules for {varname}.")
-            # if varname == 'SrcPt':
-            #     for rule in coalesced_rules:
-            #         # display(rule)
-            #         print(rule)
-            
-            rules_z3 = [eval(str(rule), evalmap) for rule in coalesced_rules]
-            relevant_rules[varname] = rules_z3
-        
-        for varname, rules in relevant_rules.items():
-            checked_rules = set()
-            for rule in rules:
-                isvalid = True
-                solver = z3.Solver()
-                rule = z3.simplify(rule)
-                solver.add(~rule)
-                if solver.check() == z3.unsat:
-                    isvalid = False
-                    # print(f"Tautology:")
-                    # display(rule)
-                
-                solver = z3.Solver()
-                solver.add(rule)
-                if solver.check() == z3.unsat:
-                    isvalid = False
-                    # print(f"Contradiction:")
-                    # display(rule)
-
-                if isvalid:
-                    checked_rules.add(rule)
-            print(f"{varname}: {len(rules)-len(checked_rules)}/{len(rules)} invalid rules.")
-            relevant_rules[varname] = list(checked_rules)
-            #* Constraint the feasible tokens within the var's domain.
-            domain_constraints = get_domain_constraints(varname, evalmap, constructor)
-            relevant_rules[varname].extend(domain_constraints)
-        # pprint(relevant_rules)
-        #TODO: Pass the rules to the sampler and partially instantiate them at inference.
 
         return TabularSampler(
             model_type=rtf_model.model_type,
@@ -743,343 +545,18 @@ class TabularSampler(REaLSampler):
             drop_na_cols=rtf_model.drop_na_cols,
             col_transform_data=rtf_model.col_transform_data,
             random_state=rtf_model.random_state,
-            col_start_pos=col_start_pos,
-            relevant_rules=relevant_rules,
-            constructor=constructor,
-            evalmap=evalmap,
-            col_ignore=col_ignore,
             device=device,
         )
-    
+
     def _prefix_allowed_tokens_fn(self, batch_id, input_ids) -> List:
         # https://huggingface.co/docs/transformers/v4.24.0/en/main_classes/text_generation#transformers.generation_utils.GenerationMixin.generate.prefix_allowed_tokens_fn
         # For the tabular data, len(input_ids) == 1 -> [BOS]
+
         # Subtract by 1 since the first valid token has index zero in
         # col_idx_ids while the input_ids already contains the [BOS] token.
-        nxt_token_idx = len(input_ids) - 1
-        #* Current token idx is len(input_ids) - 2
-        nxt_col_idx = None
-        if nxt_token_idx == 0:
-            self._generation_cache[batch_id] = {'incomplete': '', 'generated': {}}
-            self._numeric_gen[batch_id] = {'started': False}
-        #* `len(input_ids)` is the number of tokens generated so far.
-        #* It's also the column index of the next column to be generated (if all cols are categorical).
-        #* Use this as the key to get the valid tokens for the next column.
-        col_valid_tokens = self.col_idx_ids.get(nxt_token_idx, [self.vocab["token2id"][SpecialTokens.EOS]])
-        
-        col_finished = False
-        generated_val = self.vocab["id2token"][input_ids[-1].item()].split(SPECIAL_COL_SEP)[-1]
-        if nxt_token_idx in self.col_start_pos and nxt_token_idx > 0: 
-            complete_value = self._generation_cache[batch_id]['incomplete'] + generated_val
-            #* Clear the cache for the next column generation.
-            self._generation_cache[batch_id]['incomplete'] = ''
-            nxt_col_idx = self.col_start_pos.index(nxt_token_idx)
-            col_idx = nxt_col_idx - 1 #* The last column generated (not the next column to be generated)
-            if col_idx in self.col_ignore:
-                return col_valid_tokens
-            col_name = self.columns[col_idx]
-            var_name = to_big_camelcase(col_name) if self.constructor.label == 'cidds' \
-                else to_big_camelcase(col_name, '_')
-            #* Map the generated value to rule encoding
-            #! There's also a mismatch between the generated value and the value range of the rules.
-            z3val = map_to_z3var_value(var_name, complete_value, self.constructor)
-                        
-            self._generation_cache[batch_id]['generated'][var_name] = z3val
-            self._numeric_gen[batch_id] = {'started': False}
-            # assert len(self._generation_cache[batch_id]['generated']) == col_idx + 1
-            #* The current column has been fully generated.
-            if nxt_token_idx != self.col_start_pos[-1]:
-                #* If it's not the last column, generate the next column.
-                col_finished = True 
-            # else:
-            #     cur_sample_idx = list(self._sample_validities[batch_id].keys())[-1] \
-            #         if self._sample_validities[batch_id] else 0
-            #     #* Add an entry for the next sample.
-            #     self._sample_validities[cur_sample_idx+1] = True
-            # print(f"Generated {var_name}:\t{complete_value}")
-        elif nxt_token_idx > 0:
-            #* Cache the generated (incomplete) value for the current column.
-            self._generation_cache[batch_id]['incomplete'] += generated_val
-        
-        if col_finished:
-            #* Check if the generated value is valid. If not, mark this sample and skip its checks.
-            isvalidsample = self._sample_validities[batch_id]
-            #* Check the current var (for categorical vars, we can determine its validity during generation.
-            #*  But for numeric vars, we need to check the generated value against the rules after 
-            #*  complete value has been generated).
-            if isvalidsample:
-                relevant_rules = self.relevant_rules[var_name]
-                generated = [(self.evalmap[name], val) for name, val 
-                         in self._generation_cache[batch_id]['generated'].items()
-                         if name in self.evalmap]
-                s = z3.Solver()
-                for rule in relevant_rules:
-                    substituted = z3.substitute(rule, *generated)
-                    s.add(substituted)
-                if s.check() == z3.unsat:
-                    isvalidsample = False
-                    print(f"!!! Sample {batch_id=} is invalid.")
-                self._sample_validities[batch_id] = isvalidsample
-            else:
-                #* No need to check the current var, since it's already invalid.
-                return col_valid_tokens
-            
-            assert nxt_col_idx is not None
-            nxt_col_name = self.columns[nxt_col_idx]
-            nxt_var_name = to_big_camelcase(nxt_col_name) if self.constructor.label == 'cidds' \
-                else to_big_camelcase(nxt_col_name, '_')
-            relevant_rules = self.relevant_rules[nxt_var_name]
-            # print(f"\t{len(relevant_rules)=} for {nxt_var_name}")
-            
-            if not relevant_rules or nxt_var_name not in self.evalmap: 
-                return col_valid_tokens
-
-            #TODO: Figure out why 'Flows' still occurs.
-            if nxt_var_name not in self.constructor.anuta.domains:
-                return col_valid_tokens
-            domain = self.constructor.anuta.domains[nxt_var_name]
-            generated = [(self.evalmap[name], val) for name, val 
-                         in self._generation_cache[batch_id]['generated'].items()
-                         if name in self.evalmap]
-            z3var = self.evalmap[nxt_var_name]
-            valid_tokens = []
-            valid_values = []
-            #TODO: Use cache to avoid checking SAT for the same `generated`+`z3var` pair.
-            if domain.values is not None and len(domain.values) > 0:
-                #& Categorical variable or a variable with predefined values.
-                # violated_rules = []
-                for token in col_valid_tokens:
-                    value = self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1]
-                    z3val = map_to_z3var_value(nxt_var_name, value, self.constructor)
-                    
-                    substituted_rules = []
-                    # isvalidsample = True
-                    for rule in relevant_rules:
-                        substituted = z3.substitute(rule, (z3var, z3val), *generated)
-                        substituted_rules.append(z3.simplify(substituted))
-                    #     try:
-                    #         issat = bool(z3.simplify(substituted))
-                    #     except Exception as e:
-                    #         assert type(e).__name__=='Z3Exception'
-                    #         assert str(e)=='Symbolic expressions cannot be cast to concrete Boolean values.'
-                    #         # print(f"Undetermined: {substituted}")
-                    #         substituted_rules.append(substituted)
-                    #     else:
-                    #         if not issat:
-                    #             isvalidsample = False
-                    #             violated_rules.append(rule)
-                    #             break
-                    # if isvalidsample:
-                    s = z3.Solver()
-                    for rule in substituted_rules:
-                        s.add(rule)
-                    if s.check() == z3.sat:
-                        valid_tokens.append(token)
-                        valid_values.append(value)
-                # print(f"\t{len(valid_tokens_lb)}/{len(col_valid_tokens)} valid tokens for {nxt_var_name}")
-                # col_valid_tokens = valid_tokens
-                if not valid_tokens:
-                    self.num_invalid_tokens += 1
-                    print(f"!!! No valid tokens found for {nxt_var_name}. \nGenerated:")
-                    pprint(self._generation_cache[batch_id]['generated'])
-                    # for rule in violated_rules:
-                    #     display(rule)
-                    #* Mark this sample as invalid.
-                    self._sample_validities[batch_id] = False
-                    #! Force an invalid token to be generated.
-                    valid_tokens = col_valid_tokens
-                else:
-                    print(f"{nxt_var_name}: {len(valid_values)=}")
-                #! Previously I wasn't passing the valid tokens. It alwasy returned the `col_valid_tokens`, 
-                #!  that's why there were always valid tokens returned.
-                return valid_tokens
-            else:
-                #* Numeric variable with bounds.  
-                assert domain.bounds, f"{nxt_var_name} has no values or bounds in its domain."
-                substituted_rules = []
-                for rule in relevant_rules:
-                    substituted = z3.simplify(z3.substitute(rule, *generated))
-                    try:
-                            issat = bool(substituted)
-                    except Exception as e:
-                        assert type(e).__name__=='Z3Exception'
-                        assert str(e)=='Symbolic expressions cannot be cast to concrete Boolean values.'
-                        #* Skip True/False rules.
-                        substituted_rules.append(substituted)
-                
-                opt = z3.Optimize()
-                for rule in substituted_rules:
-                    opt.add(rule)
-                lb = opt.minimize(z3var)
-                if opt.check() == z3.sat:
-                    lb = lb.value()
-                    if isinstance(lb, z3.RatNumRef):
-                        lb = float(lb.as_fraction())
-                    elif isinstance(lb, z3.IntNumRef):
-                        lb = lb.as_long()
-                    else:
-                        assert isinstance(lb, z3.ArithRef), f"Unknown {type(lb)=} for {lb=}"
-                        # print(f"z3.ArithRef: {lb=}")
-                        domain = self.constructor.anuta.domains[nxt_var_name]
-                        lb = domain.bounds.lb
-                        # for rule in substituted_rules:
-                        #     display(rule)
-                else:
-                    print(f"[Optm] Can't obtain logit lower bound for {z3var}")
-                    domain = self.constructor.anuta.domains[nxt_var_name]
-                    lb = domain.bounds.lb
-                    for rule in substituted_rules:
-                        display(rule)
-                
-                opt = z3.Optimize()
-                for rule in substituted_rules:
-                    opt.add(rule)
-                ub = opt.maximize(z3var)
-                if opt.check() == z3.sat:
-                    ub = ub.value()
-                    if isinstance(ub, z3.RatNumRef):
-                        ub = float(ub.as_fraction())
-                    elif isinstance(ub, z3.IntNumRef):
-                        ub = ub.as_long()
-                    else:
-                        assert isinstance(lb, z3.ArithRef), f"Unknown {type(ub)=} for {ub=}"
-                        # print(f"z3.ArithRef: {ub=}")
-                        domain = self.constructor.anuta.domains[nxt_var_name]
-                        ub = domain.bounds.ub
-                        # for rule in substituted_rules:
-                        #     display(rule)
-                else:
-                    print(f"[Optm] Can't obtain logit upper bound for {z3var}")
-                    domain = self.constructor.anuta.domains[nxt_var_name]
-                    ub = domain.bounds.ub
-                    for rule in substituted_rules:
-                        display(rule)
-
-                # print(f"\tLimits for {nxt_var_name}: {lb} ≤ {z3var} ≤ {ub}")
-                #TODO: Check if lb==ub -> fast forward generation.
-                #* Tokenize lb and ub in the same way as the generated values.
-                transform_data = self.col_transform_data[nxt_col_name]
-                if transform_data['mx_sig'] < 0:
-                    #* Integer
-                    total_digits = transform_data['zfill']
-                    #* Convert to string and pad with zeros.
-                    lb_str = str(int(lb)).zfill(total_digits)
-                    ub_str = str(int(ub)).zfill(total_digits)
-                    integers = total_digits
-                    decimals = 0
-                else:
-                    #* Floats
-                    total_digits = transform_data['ljust'] - 1
-                    integers = transform_data['mx_sig']
-                    decimals = total_digits - integers
-                    lb_str = str(round(lb, decimals))
-                    ub_str = str(round(ub, decimals))
-                    if '.' not in lb_str: lb_str += '.'
-                    if '.' not in ub_str: ub_str += '.'
-                    # missing_integers = integers - len(lb_str.split('.')[0])
-                    lb_str = lb_str.split('.')[0].zfill(integers) + '.' + lb_str.split('.')[1]
-                    # missing_integers = integers - len(ub_str.split('.')[0])
-                    ub_str = ub_str.split('.')[0].zfill(integers) + '.' + ub_str.split('.')[1]
-                    # if '.' not in lb_str: 
-                    #     lb_str = lb_str.zfill(integers) + '.'
-                    # if '.' not in ub_str: 
-                    #     ub_str = ub_str.zfill(integers) + '.'
-                    #* Pad with zeros after the decimal point.
-                    lb_str = lb_str.ljust(transform_data['ljust'], '0')
-                    ub_str = ub_str.ljust(transform_data['ljust'], '0')
-                    assert len(lb_str.split('.')[0]) == integers, f"{lb_str=}, {integers=}"
-                    assert len(lb_str.split('.')[1]) == decimals, f"{lb_str=}, {decimals=}"
-                # print(f"Limits: {lb_str} ≤ {z3var} ≤ {ub_str}")
-                
-                self._numeric_gen[batch_id]['started'] = True
-                self._numeric_gen[batch_id]['allvalid'] = False
-                self._numeric_gen[batch_id]['transform_data'] = transform_data
-                self._numeric_gen[batch_id]['var_name'] = nxt_var_name
-                self._numeric_gen[batch_id]['rules'] = substituted_rules
-                self._numeric_gen[batch_id]['bounds'] = (lb_str, ub_str)
-                self._numeric_gen[batch_id]['digits'] = total_digits
-                self._numeric_gen[batch_id]['integer'] = integers
-                self._numeric_gen[batch_id]['decimals'] = decimals
-                self._numeric_gen[batch_id]['nxt_idx'] = -1
-        #* End> if col_finished
-                
-        if self._numeric_gen[batch_id]['started'] and not self._numeric_gen[batch_id]['allvalid']:
-            var_name = self._numeric_gen[batch_id]['var_name']
-            # print(f"Generating {var_name}: {self._generation_cache[batch_id]['incomplete']}")
-            
-            self._numeric_gen[batch_id]['nxt_idx'] += 1
-            if (self._numeric_gen[batch_id]['decimals'] > 0 and 
-                self._numeric_gen[batch_id]['integer'] == self._numeric_gen[batch_id]['nxt_idx']):
-                #* Only decimal point is valid.
-                valid_tokens_lb = [token for token in col_valid_tokens 
-                                   if self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1] == '.']
-                return valid_tokens_lb
-            
-            nxt_idx = self._numeric_gen[batch_id]['nxt_idx']
-            #* Check if the last generated digit.
-            if nxt_idx > 0:
-                lb_str, ub_str = self._numeric_gen[batch_id]['bounds']
-                assert lb_str is not None or ub_str is not None
-                lb_digit = lb_str[nxt_idx-1] if lb_str is not None else ' ' #* Space is less than any digit.
-                ub_digit = ub_str[nxt_idx-1] if ub_str is not None else 'z' #* z is greater than any digit.
-                last_digit = generated_val
-                if lb_digit == ub_digit:
-                    assert last_digit == lb_digit, f"{last_digit=}, {lb_digit=}, {ub_digit=}"
-                else:
-                    if lb_digit < last_digit < ub_digit:
-                        #* No need to check other digits, e.g., 098 < 4XX < 501
-                        self._numeric_gen[batch_id]['allvalid'] = True
-                        # print(f"\tSkip checks as of {var_name}[{nxt_idx}].")
-                        return col_valid_tokens
-                    else:
-                        #* At least one of the bounds is equal to the last digit.
-                        #* Need to check the next digit.
-                        assert lb_digit == last_digit or last_digit == ub_digit, (
-                            f"{last_digit=}, {lb_digit=}, {ub_digit=}")
-                        #* Check if one of the bounds is discarded already.
-                        if lb_digit != ' ' and ub_digit != 'z':
-                            if lb_digit == last_digit:
-                                #* Upper bound is guaranteed to be valid, thus ignored.
-                                self._numeric_gen[batch_id]['bounds'] = (lb_str, None)
-                                # print(f"\tDiscard upper bound for {var_name}[{nxt_idx}].")
-                            else:
-                                #* Lower bound is guaranteed to be valid, thus ignored.
-                                self._numeric_gen[batch_id]['bounds'] = (None, ub_str)
-                                # print(f"\tDiscard lower bound for {var_name}[{nxt_idx}].")
-            
-            lb_str, ub_str = self._numeric_gen[batch_id]['bounds']
-            # print(f"Checking: {lb_str} ≤ {var_name}[{nxt_idx}] ≤ {ub_str}")
-            invalid_values = []
-            valid_tokens_lb = []
-            if lb_str is not None:
-                lb_digit = lb_str[nxt_idx]
-                for token in col_valid_tokens:
-                    value = self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1]
-                    if value >= lb_digit:
-                        valid_tokens_lb.append(token)
-                    else:
-                        invalid_values.append(value)
-            if valid_tokens_lb:
-                col_valid_tokens = valid_tokens_lb
-                
-            valid_tokens = []
-            if ub_str is not None:
-                ub_digit = ub_str[nxt_idx]
-                for token in col_valid_tokens:
-                    value = self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1]
-                    if value <= ub_digit:
-                        valid_tokens.append(token)
-                    else:
-                        invalid_values.append(value)
-            else:
-                valid_tokens = col_valid_tokens
-            
-            # print(f"\t{len(valid_tokens)}/{len(col_valid_tokens)} valid tokens for {var_name}[{nxt_idx}].")
-            # print(f"\tInvalid tokens: {invalid_values}")
-            assert valid_tokens, f"No valid tokens for {var_name} at index {nxt_idx}."
-            return valid_tokens
-
-        return col_valid_tokens
+        return self.col_idx_ids.get(
+            len(input_ids) - 1, [self.vocab["token2id"][SpecialTokens.EOS]]
+        )
 
     def _process_seed_input(
         self, seed_input: Union[pd.DataFrame, Dict[str, Any]]
@@ -1119,7 +596,6 @@ class TabularSampler(REaLSampler):
     def sample_tabular(
         self,
         n_samples: int,
-        check_rules: bool = False,
         gen_batch: Optional[int] = 128,
         device: Optional[str] = "cuda",
         seed_input: Optional[Union[pd.DataFrame, Dict[str, Any]]] = None,
@@ -1140,40 +616,19 @@ class TabularSampler(REaLSampler):
 
         if seed_input is None:
             generated = torch.tensor(
-                #* Insert beginning of sentence token
                 [self.vocab["token2id"][SpecialTokens.BOS] for _ in range(1)]
             ).unsqueeze(0)
         else:
-            #? Not sure what this is for.
             generated = self._process_seed_input(seed_input=seed_input)
 
         generated = generated.to(self.model.device)
-        
-        if check_rules:
-            #* Load rules
-            rules: List[sp.Expr] = []
-            path = "/home/hh1789/Projects/REaLTabFormer/rules/learned_cicids_8192_checked.pl"
-            # path = "/home/hh1789/Projects/REaLTabFormer/rules/learned_cidds_8192_checked.pl"
-            with open(f"{path}", 'r') as f:
-                for i, line in enumerate(f):
-                    expr: sp.Expr = sp.sympify(line.strip())
-                    rules.append(expr)
-                    print(f"Loaded # of rules:\t{i+1}", end='\r')
-            print(f"Loaded # of rules:\t{i+1}")
-            #TODO: move to device or load the generated outputs to back to cpu for checking and then back to device?
-            # rules = torch.tensor(rules).to(device)
 
-        start_time = perf_counter()
-        #! `n_samples` is NOT a hard limit. The actual number samples is not enforeced and
-        #! can exceed this specified value.
         with tqdm(total=n_samples) as pbar:
             pbar_num_gen = 0
             num_generated = 0
             empty_limit = continuous_empty_limit
 
             while num_generated < n_samples:
-                self._sample_validities = [True for _ in range(gen_batch)]
-                
                 # https://huggingface.co/docs/transformers/internal/generation_utils
                 sample_outputs = self._generate(
                     device=device,
@@ -1192,64 +647,16 @@ class TabularSampler(REaLSampler):
                 )
 
                 self.total_gen_samples += len(sample_outputs)
-                # self.invalid_gen_samples += len(sample_outputs)
-                invalid_sample_idxes = [i for i, sampleisvalid in enumerate(self._sample_validities) if not sampleisvalid]
+                self.invalid_gen_samples += len(sample_outputs)
 
-                #? Are the following operations happening on the device?
                 try:
-                    synth_sample: pd.DataFrame = self._processes_sample(
+                    synth_sample = self._processes_sample(
                         sample_outputs=sample_outputs,
                         vocab=self.vocab,
                         validator=validator,
                     )
-                    
-                    if check_rules:
-                        #* Rule-compliance check.
-                        violated_rules = set()
-                        print(f"Checking rule-compliance for {len(synth_sample)} samples...")
-                        for i, sample in tqdm(synth_sample.iterrows(), total=len(synth_sample)):
-                            assignment = {}
-                            
-                            # #* CIDDS
-                            # for key in sample.keys():
-                            #     if 'Date' in key or 'Flows' in key:
-                            #         continue
-                            #     if 'Flags' in key:
-                            #         value = cidds_flag_map(sample[key])
-                            #     elif 'Proto' in key:
-                            #         value = cidds_proto_map(sample[key])
-                            #     elif 'IP' in key:
-                            #         value = cidds_ip_map(sample[key])
-                            #     else:
-                            #         value = sample[key]
-                            #     var = to_big_camelcase(key)
-                            #     assignment[var] = value
-                            
-                            #* CIC
-                            for key in sample.keys():
-                                if 'ID' in key or 'IP' in key: 
-                                    continue
-                                value = sample[key]
-                                var = to_big_camelcase(key, sep='_')
-                                assignment[var] = value
-                            
-                            for rule in rules:
-                                # print(f"{assignment=}")
-                                sat = rule.subs(assignment)
-                                if not sat:
-                                    violated_rules.add(i)
-                                    break
-                        #* Remove samples that violate the rules
-                        print(f"\nRemoved {len(violated_rules)}/{len(synth_sample)} samples that violated the rules.")
-                        synth_sample = synth_sample.drop(violated_rules)
-                    else:
-                        print(f"(Batch) Generated {len(invalid_sample_idxes)}/{len(synth_sample)} invalid samples.")
-                        # synth_sample = synth_sample.drop(invalid_sample_idxes)
-                    
                     empty_limit = continuous_empty_limit
-                    # self.invalid_gen_samples -= len(synth_sample)
-                    self.invalid_gen_samples += len(invalid_sample_idxes)
-                    # print(f"Generated {len(synth_sample)} valid samples.")
+                    self.invalid_gen_samples -= len(synth_sample)
 
                 except SampleEmptyError as exc:
                     logging.warning("This batch returned an empty valid synth_sample!")
@@ -1262,24 +669,19 @@ class TabularSampler(REaLSampler):
 
                 num_generated += len(synth_sample)
                 synth_df.append(synth_sample)
-                print(f"Generated {num_generated}/{n_samples} samples.")
 
                 # Update process bar
                 pbar.update(num_generated - pbar_num_gen)
                 pbar_num_gen = num_generated
-        
-        end_time = perf_counter()
-        
+
         synth_df = pd.concat(synth_df).sample(
             n=n_samples, replace=False, random_state=self.random_state
         )
         synth_df = synth_df.reset_index(drop="index")
 
         print(
-            f"Invalid samples {self.invalid_gen_samples}/{self.total_gen_samples}. Sampling efficiency is: {100 * (1 -  self.invalid_gen_samples / self.total_gen_samples):.4f}%"
+            f"Generated {self.invalid_gen_samples} invalid samples out of total {self.total_gen_samples} samples generated. Sampling efficiency is: {100 * (1 -  self.invalid_gen_samples / self.total_gen_samples):.4f}%"
         )
-        print(f"Total time taken: {end_time - start_time:.2f}s")
-        print(f"Total invalid tokens generated: {self.num_invalid_tokens}")
 
         return synth_df
 
