@@ -103,6 +103,7 @@ cidds_ports = [0, 3, 8, 11, 22, 25,
             #    23, #* Telnet
             #    8000, #* Seafile Server
                53, 67, 68, 80, 123, 137, 138, 443, 8080]
+cidds_ports_str = [f"{port}pt" for port in cidds_ports]
 cidds_ints = ['Packets', 'Bytes', 'Flows'] + cidds_categorical
 cidds_reals = ['Duration']
 
