@@ -1,42 +1,5 @@
 from bidict import bidict
 import z3
-
-
-def map_to_z3var_value(var_name, value, constructor):
-    var_val = None
-    match constructor.label:
-        case 'cidds':
-            #TODO: Wrap the mapping from generated value to rule encoding in a function.
-            if var_name=='Flags':
-                var_val = z3.IntVal(cidds_flag_map(value))
-            elif var_name=='Proto':
-                var_val = z3.IntVal(cidds_proto_map(value))
-            elif 'ip' in var_name.lower():
-                var_val = z3.IntVal(cidds_ip_map(value))
-            elif 'pt' in var_name.lower():
-                value = int(value[:-2]) if value[-2:] == 'pt' else int(value)
-                var_val = z3.IntVal(value)
-            else:
-                try:
-                    if '.' in value:
-                        var_val = z3.RealVal(float(value))
-                    elif '_' not in value:
-                        var_val = z3.IntVal(int(value))
-                except ValueError:
-                    var_val = value
-        case 'cicids':
-            domain = constructor.anuta.domains[var_name]
-            if var_name == 'Protocol':
-                var_val = z3.IntVal(int(value))
-            elif type(domain.bounds.lb)==float or type(domain.bounds.ub)==float:
-                var_val = z3.RealVal(float(value))
-            else:
-                var_val = z3.IntVal(int(value))
-        case _:
-            raise ValueError(f"Unknown dataset: {constructor.label}")
-    
-    assert var_val is not None, f"Rule value not mapped for {var_name}={value}"
-    return var_val
         
 
 #******************** Netflix data Domain Knowledge begins ********************

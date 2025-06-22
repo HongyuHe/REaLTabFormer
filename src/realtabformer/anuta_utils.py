@@ -29,32 +29,6 @@ def or_expr(*args): return z3.Or(*args)
 def implies_expr(a, b): return z3.Implies(a, b)
 z3evalmap = {'Eq': eq_expr, 'Ne': ne_expr, 'And': and_expr, 'Or': or_expr, 'Implies': implies_expr}
 
-def get_domain_constraints(varname, evalmap, constructor):
-    domain_constraints = []
-    if varname not in constructor.anuta.domains:
-        return domain_constraints
-    domain = constructor.anuta.domains[varname]
-    z3_var = evalmap[varname]
-    if domain.bounds:
-        #& For numerical vars.
-        if type(domain.bounds.lb)==int or type(domain.bounds.ub)==int:
-            domain_constraints.append(z3_var >= z3.IntVal(domain.bounds.lb))
-            domain_constraints.append(z3_var <= z3.IntVal(domain.bounds.ub))
-        else:
-            domain_constraints.append(z3_var >= z3.RealVal(domain.bounds.lb))
-            domain_constraints.append(z3_var <= z3.RealVal(domain.bounds.ub))
-    else:
-        #! Adding domain constraints for categorical vars may lead to unsatisfiability for some reason...
-        pass
-        #& For categorical vars or vars with predefined values.
-        # assert len(domain.values)>0
-        # if any(type(val)!=np.int64 for val in domain.values):
-        #     domain_constraints.append(z3.Or([z3_var==z3.RealVal(val) for val in domain.values]))
-        # else:
-        #     domain_constraints.append(z3.Or([z3_var==z3.IntVal(val) for val in domain.values]))
-
-    return domain_constraints
-
 def coalesce(rules) -> sp.Expr:
     coalesced_rules: Dict[str, sp.Expr] = {}
     conflict_count = 0

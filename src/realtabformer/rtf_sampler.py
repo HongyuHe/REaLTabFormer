@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     from .realtabformer import REaLTabFormer
     
 import json
+import pickle
+import networkx as nx
 from functools import cache
 from collections import OrderedDict
 import z3
@@ -46,13 +48,84 @@ from .data_utils import *
 # )
 from .rtf_exceptions import SampleEmptyError, SampleEmptyLimitError
 from .rtf_validators import ObservationValidator
-from .anuta_utils import *
-from .anuta_known import *
+
+from collections import defaultdict
+# from .anuta_utils import *
+# from .anuta_known import *
 import anuta
 from anuta.constructor import Cidds001, Cicids2017
+from anuta.known import cidds_ints, cidds_reals
+from anuta.utils import z3evalmap, cidds_flag_map, cidds_proto_map, cidds_ip_map, known_ports
 
 NQ_COL = "_nq_ds_"
 
+cidds_ports_str = [f"{port}pt" for port in cidds_ports]
+
+def get_domain_constraints(varname, evalmap, constructor):
+    if constructor.label == 'metadc': 
+        #* Domain constraints are already included in the rules.
+        return []
+    
+    domain_constraints = []
+    if varname not in constructor.anuta.domains:
+        return domain_constraints
+    domain = constructor.anuta.domains[varname]
+    z3_var = evalmap[varname]
+    if domain.bounds:
+        #& For numerical vars.
+        if type(domain.bounds.lb)==int or type(domain.bounds.ub)==int:
+            domain_constraints.append(z3_var >= z3.IntVal(domain.bounds.lb))
+            domain_constraints.append(z3_var <= z3.IntVal(domain.bounds.ub))
+        else:
+            domain_constraints.append(z3_var >= z3.RealVal(domain.bounds.lb))
+            domain_constraints.append(z3_var <= z3.RealVal(domain.bounds.ub))
+    else:
+        #! Adding domain constraints for categorical vars may lead to unsatisfiability for some reason...
+        pass
+        #& For categorical vars or vars with predefined values.
+        # assert len(domain.values)>0
+        # if any(type(val)!=np.int64 for val in domain.values):
+        #     domain_constraints.append(z3.Or([z3_var==z3.RealVal(val) for val in domain.values]))
+        # else:
+        #     domain_constraints.append(z3.Or([z3_var==z3.IntVal(val) for val in domain.values]))
+
+    return domain_constraints
+
+def map_to_z3var_value(var_name, value, constructor):
+    var_val = None
+    match constructor.label:
+        case 'cidds':
+            #TODO: Wrap the mapping from generated value to rule encoding in a function.
+            if var_name=='Flags':
+                var_val = z3.IntVal(cidds_flag_map(value))
+            elif var_name=='Proto':
+                var_val = z3.IntVal(cidds_proto_map(value))
+            elif 'ip' in var_name.lower():
+                var_val = z3.IntVal(cidds_ip_map(value))
+            elif 'pt' in var_name.lower():
+                value = int(value[:-2]) if value[-2:] == 'pt' else int(value)
+                var_val = z3.IntVal(value)
+            else:
+                try:
+                    if '.' in value:
+                        var_val = z3.RealVal(float(value))
+                    elif '_' not in value:
+                        var_val = z3.IntVal(int(value))
+                except ValueError:
+                    var_val = value
+        case 'cicids':
+            domain = constructor.anuta.domains[var_name]
+            if var_name == 'Protocol':
+                var_val = z3.IntVal(int(value))
+            elif type(domain.bounds.lb)==float or type(domain.bounds.ub)==float:
+                var_val = z3.RealVal(float(value))
+            else:
+                var_val = z3.IntVal(int(value))
+        case _:
+            raise ValueError(f"Unknown dataset: {constructor.label}")
+    
+    assert var_val is not None, f"Rule value not mapped for {var_name}={value}"
+    return var_val
 
 class REaLSampler:
     def __init__(
@@ -267,6 +340,8 @@ class REaLSampler:
         if "eos_token_id" not in generate_kwargs:
             generate_kwargs["eos_token_id"] = vocab["token2id"][SpecialTokens.EOS]
 
+        #TODO: Customize `inputs` to pass part of the example as the "prompt"
+        # https://huggingface.co/docs/transformers/en/main_classes/text_generation#transformers.GenerationMixin.generate.inputs
         _samples = self.model.generate(**generate_kwargs)
 
         if as_numpy:
@@ -523,7 +598,9 @@ class TabularSampler(REaLSampler):
         drop_na_cols: List,
         col_transform_data: Dict,
         random_state: Optional[int] = 1029,
+        
         col_start_pos: Optional[List[int]] = None,
+        varnames: List[str] = [],
         relevant_rules: Optional[Dict[str, List[z3.ExprRef]]] = None,
         constructor: Optional[anuta.constructor.Constructor ] = None,
         evalmap: Optional[Dict[str, z3.ExprRef]] = None,
@@ -561,7 +638,11 @@ class TabularSampler(REaLSampler):
         self.num_invalid_tokens = 0
         self._sample_validities: List[bool] = []
         
-        self.trie_node = 'root'
+        self.varnames = varnames
+        
+        with open("/home/hh1789/Notebooks/data/cidds_trie_prefix_freeflags.pkl", 'rb') as f:
+            self.trie: nx.DiGraph= pickle.load(f)
+            print(f"Loaded trie with {len(self.trie.nodes())} nodes and {len(self.trie.edges())} edges.")
 
     @staticmethod
     def sampler_from_model(rtf_model: 'REaLTabFormer', dataset: str='cidds', device: str = "cuda"):
@@ -592,31 +673,43 @@ class TabularSampler(REaLSampler):
         constructor = None
         col_todrop = []
         col_ignore = []
+        varnames = []
         match dataset:
             case 'cidds':
                 rulepath = "/home/hh1789/Projects/REaLTabFormer/rules/learned_cidds_8192_checked.pl"
                 datapath = "/scratch/gpfs/hh1789/data/cidds_wk3_all.csv"
                 constructor = Cidds001(datapath)
                 col_todrop = ['Flows']
-                for col in col_todrop:
-                    if col in rtf_model.columns:
-                        col_ignore.append(rtf_model.columns.index(col))
-                        # rtf_model.columns.remove(col)
+                varnames = [to_big_camelcase(col) for col in rtf_model.columns]
+                # rtf_model.column_dtypes = {
+                #     to_big_camelcase(col): dtype for col, dtype in rtf_model.column_dtypes.items()
+                # }
             case 'cicids':
                 rulepath = "/home/hh1789/Projects/REaLTabFormer/rules/learned_cicids_8192_checked.pl"
                 datapath = "/scratch/gpfs/hh1789/data/cicids_monday_all.csv"
                 constructor = Cicids2017(datapath)
                 col_todrop = ['Down_Up_Ratio', 'Average_Packet_Size', 'Avg_Fwd_Segment_Size', 'Avg_Bwd_Segment_Size', 
-                           'Fwd_Avg_Bytes_Bulk', 'Fwd_Avg_Packets_Bulk', 'Fwd_Avg_Bulk_Rate', 'Bwd_Avg_Bytes_Bulk', 
-                           'Bwd_Avg_Packets_Bulk', 'Bwd_Avg_Bulk_Rate', 'Subflow_Fwd_Packets', 'Subflow_Fwd_Bytes', 
-                           'Subflow_Bwd_Packets', 'Subflow_Bwd_Bytes', 'Init_Win_bytes_fwd', 'Init_Win_bytes_bwd', 
-                           'act_data_pkt_fwd', 'min_seg_size_fwd', 'Source_Port', 'Destination_Port', ]
-                for col in col_todrop:
-                    if col in rtf_model.columns:
-                        col_ignore.append(rtf_model.columns.index(col))
-                        # rtf_model.columns.remove(col)
+                            'Fwd_Avg_Bytes_Bulk', 'Fwd_Avg_Packets_Bulk', 'Fwd_Avg_Bulk_Rate', 'Bwd_Avg_Bytes_Bulk', 
+                            'Bwd_Avg_Packets_Bulk', 'Bwd_Avg_Bulk_Rate', 'Subflow_Fwd_Packets', 'Subflow_Fwd_Bytes', 
+                            'Subflow_Bwd_Packets', 'Subflow_Bwd_Bytes', 'Init_Win_bytes_fwd', 'Init_Win_bytes_bwd', 
+                            'act_data_pkt_fwd', 'min_seg_size_fwd', 'Source_Port', 'Destination_Port', ]
+                col_todrop = [to_big_camelcase(col, '_') for col in col_todrop]
+                varnames = [to_big_camelcase(col, '_') for col in rtf_model.columns]
+                # rtf_model.column_dtypes = {
+                #     to_big_camelcase(col, '_'): dtype for col, dtype in rtf_model.column_dtypes.items()
+                # }
+            case 'metadc':
+                rulepath = '/home/hh1789/Projects/REaLTabFormer/rules/lgbm_metadc_all.pl'
+                datapath = '/scratch/gpfs/hh1789/data/metadc_train.csv'
+                col_todrop = ['rackid', 'hostid']
+                varnames = rtf_model.columns
             case _:
                 raise ValueError(f"Unknown dataset: {dataset}")
+
+        for col in col_todrop:
+            if col in rtf_model.columns:
+                col_ignore.append(rtf_model.columns.index(col))
+                # rtf_model.columns.remove(col)
         rules_sp = []
         with open(f"{rulepath}", 'r') as f:
             for i, line in enumerate(f):
@@ -625,8 +718,7 @@ class TabularSampler(REaLSampler):
                 print(f"Loaded # of rules:\t{i+1}", end='\r')
         
         #* First, complete the evalmap for sp to z3 conversion.
-        for col in rtf_model.columns:
-            varname = to_big_camelcase(col) if dataset == 'cidds' else to_big_camelcase(col, '_')
+        for varname in varnames:
             match dataset:
                 case 'cidds':
                     #* Update the evalmap with vars.
@@ -643,21 +735,22 @@ class TabularSampler(REaLSampler):
                             evalmap[varname] = z3.Real(varname)
                         else:
                             evalmap[varname] = z3.Int(varname)
+                case 'metadc':
+                    evalmap[varname] = z3.Int(varname)
+                case _:
+                    raise ValueError(f"Unknown dataset: {dataset}")
         
         relevant_rules = defaultdict(list)
-        for i, col in enumerate(rtf_model.columns):
+        for i, varname in enumerate(varnames):
             relevant = []
             filtered_relevant = []
-            varname = to_big_camelcase(col) if dataset == 'cidds' else to_big_camelcase(col, '_')
-            prefix_vars = set(sp.symbols([to_big_camelcase(name) for name in rtf_model.columns[: i]]))\
-                if dataset == 'cidds' else \
-                    set(sp.symbols([to_big_camelcase(name, '_') for name in rtf_model.columns[: i]]))
+            prefix_vars = set(sp.symbols([name for name in varnames[: i]]))
             
             cur_var = sp.symbols(varname)
             included_vars = prefix_vars | {cur_var}
             for rule in rules_sp:
-                variables = rule.free_symbols
-                num_vars = len(variables)
+                rule_vars = rule.free_symbols
+                num_vars = len(rule_vars)
                 
                 # #& All connected rules.
                 # if len(variables & included_vars) > 0:
@@ -671,7 +764,7 @@ class TabularSampler(REaLSampler):
                 #     relevant.append(rule)
 
                 #& Prefix rules only.
-                if cur_var in variables and len(variables & (prefix_vars | {cur_var})) == num_vars:
+                if cur_var in rule_vars and len(rule_vars & (prefix_vars | {cur_var})) == num_vars:
                     #* rule has to contain current var AND the rest of vars are all prefixes
                     relevant.append(rule)
             print(f"Found {len(relevant)} relevant rules for {varname}.")
@@ -679,11 +772,12 @@ class TabularSampler(REaLSampler):
             #* Filter redundant rules
             for rule in relevant:
                 if isinstance(rule, sp.Implies):
-                    precedent, consequent = rule.args
-                    if isinstance(precedent, sp.And):
-                        p1, p2 = precedent.args
+                    antecedent, consequent = rule.args
+                    if isinstance(antecedent, sp.And):
+                        p1, p2 = antecedent.args
                         # pprint(rule)
                         # pprint([p1.free_symbols, p2.free_symbols])
+                        #* Tautology: (X=x1 ∧ X=x2) ⇒ ...
                         if p1.free_symbols == p2.free_symbols:
                             # pprint(rule)
                             continue
@@ -699,6 +793,8 @@ class TabularSampler(REaLSampler):
             # #         print(rule)
             
             # rules_z3 = [eval(str(rule), evalmap) for rule in coalesced_rules]
+            # print(str(rule))
+            display(eval(str(rule), evalmap))
             rules_z3 = [eval(str(rule), evalmap) for rule in filtered_relevant]
             relevant_rules[varname] = rules_z3
         
@@ -748,7 +844,9 @@ class TabularSampler(REaLSampler):
             drop_na_cols=rtf_model.drop_na_cols,
             col_transform_data=rtf_model.col_transform_data,
             random_state=rtf_model.random_state,
+            
             col_start_pos=col_start_pos,
+            varnames=varnames,
             relevant_rules=relevant_rules,
             constructor=constructor,
             evalmap=evalmap,
@@ -756,37 +854,32 @@ class TabularSampler(REaLSampler):
             device=device,
         )
     
-    @cache
+    # @cache
     def _is_token_valid(self, token: int, nxt_var_name: str, generated: Tuple) -> bool:
         value = self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1]
         #* Domain knowledge: Only check known ports.
         if 'Pt' in nxt_var_name and value not in cidds_ports_str:
             return True
+        
         z3var = self.evalmap[nxt_var_name]
         z3val = map_to_z3var_value(nxt_var_name, value, self.constructor)
-        relevant_rule = self.relevant_rules[nxt_var_name]
         
-        # substituted_rules = []
-        # for rule in relevant_rule:
-        #     substituted = z3.substitute(rule, (z3var, z3val), *generated)
-        #     substituted_rules.append(z3.simplify(substituted))
+        #& Using AND-combined rules.
+        relevant_rule = self.relevant_rules[nxt_var_name]
+        if not relevant_rule: 
+            #* No rules to check for this variable.
+            return True
         substituted = z3.simplify(z3.substitute(relevant_rule, (z3var, z3val), *generated))
         s = z3.Solver()
         s.add(substituted)
-        # for rule in substituted_rules:
-        #     s.add(rule)
-        
         return True if s.check() == z3.sat else False
     
-    @cache
+    # @cache
     def _solve_for_minmax(self, nxt_var_name: str, generated: Tuple) -> Tuple[float, float]:
         relevant_rule = self.relevant_rules[nxt_var_name]
         z3var = self.evalmap[nxt_var_name]
-        # substituted_rules = []
-        # for rule in relevant_rules:
-        #     substituted = z3.simplify(z3.substitute(rule, *generated))
-        #     substituted_rules.append(substituted)
         
+        #& Using AND-combined rules.
         opt = z3.Optimize()
         substituted = z3.simplify(z3.substitute(relevant_rule, *generated))
         opt.add(substituted)
@@ -868,14 +961,21 @@ class TabularSampler(REaLSampler):
             if col_idx in self.col_ignore:
                 return col_valid_tokenids
             col_name = self.columns[col_idx]
-            var_name = to_big_camelcase(col_name) if self.constructor.label == 'cidds' \
-                else to_big_camelcase(col_name, '_')
+            var_name = self.varnames[col_idx]
             #* Map the generated value to rule encoding
             #! There's also a mismatch between the generated value and the value range of the rules.
             z3val = map_to_z3var_value(var_name, complete_value, self.constructor)
                         
             self._generation_cache[batch_id]['generated'][var_name] = z3val
             #TODO: Update trie node.
+            parent_id = self.parent_node[batch_id]
+            self.parent_node[batch_id] = f"{parent_id}->{var_name}" \
+                if self.column_dtypes[col_name]!='object' \
+                    else f"{parent_id}->{var_name}::{int(z3val.as_long())}"
+            #* Deal with private ports.
+            if 'Pt' in var_name and complete_value not in cidds_ports_str:
+                self.parent_node[batch_id] = f"{parent_id}->{var_name}::60000"
+            # print(f"\tCurrent trie node: {self.parent_node[batch_id].split('->')[-1]}")
             self._numeric_gen[batch_id] = {'started': False}
             # assert len(self._generation_cache[batch_id]['generated']) == col_idx + 1
             #* The current column has been fully generated.
@@ -893,17 +993,18 @@ class TabularSampler(REaLSampler):
             #* Check the current var (for categorical vars, we can determine its validity during generation.
             #*  But for numeric vars, we need to check the generated value against the rules after 
             #*  complete value has been generated).
-            if isvalidsample:
+            if isvalidsample: # and self._numeric_gen[batch_id]['started']: #! Only check numeric vars when using the trie.
                 relevant_rule = self.relevant_rules[var_name]
                 generated = [(self.evalmap[name], val) for name, val 
-                         in self._generation_cache[batch_id]['generated'].items()
-                         if name in self.evalmap]
+                            in self._generation_cache[batch_id]['generated'].items()
+                            if name in self.evalmap]
                 s = z3.Solver()
-                substituted = z3.substitute(relevant_rule, *generated)
+                try:
+                    substituted = z3.substitute(relevant_rule, *generated)
+                except z3.Z3Exception as e:
+                    print(f"!!! Z3Exception: {e} for {var_name=} {relevant_rule=}")
+                    raise e
                 s.add(substituted)
-                # for rule in relevant_rules:
-                #     substituted = z3.substitute(rule, *generated)
-                #     s.add(substituted)
                 if s.check() == z3.unsat:
                     isvalidsample = False
                     print(f"!!! Sample {batch_id=} is invalid.")
@@ -913,9 +1014,7 @@ class TabularSampler(REaLSampler):
                 return col_valid_tokenids
             
             assert nxt_col_idx is not None
-            nxt_col_name = self.columns[nxt_col_idx]
-            nxt_var_name = to_big_camelcase(nxt_col_name) if self.constructor.label == 'cidds' \
-                else to_big_camelcase(nxt_col_name, '_')
+            nxt_var_name = self.varnames[nxt_col_idx]
             # relevant_rule = self.relevant_rules[nxt_var_name]
             # print(f"\t{len(relevant_rules)=} for {nxt_var_name}")
             
@@ -925,22 +1024,41 @@ class TabularSampler(REaLSampler):
             #TODO: Figure out why 'Flows' still occurs.
             if nxt_var_name not in self.constructor.anuta.domains:
                 return col_valid_tokenids
+            
             domain = self.constructor.anuta.domains[nxt_var_name]
-            generated = [(self.evalmap[name], val) for name, val 
-                         in self._generation_cache[batch_id]['generated'].items()
-                         if name in self.evalmap]
-            # z3var = self.evalmap[nxt_var_name]
+            # generated = [(self.evalmap[name], val) for name, val 
+            #              in self._generation_cache[batch_id]['generated'].items()
+            #              if name in self.evalmap]
+            generated = [] #* No need when using the trie.
             valid_tokens = []
-            # valid_values = []
             if domain.values is not None and len(domain.values) > 0:
                 #& Categorical variable or a variable with predefined values.
-                for token in col_valid_tokenids:
-                    isvalid = self._is_token_valid(token, nxt_var_name, tuple(generated))
+                nxt_values = [self.trie.nodes[nodeid]['value']
+                              for nodeid in self.trie.successors(self.parent_node[batch_id])]
+                assert len(nxt_values) > 0, f"No child nodes for {self.parent_node[batch_id]}"
+                for tokenid in col_valid_tokenids:
+                    # isvalid = self._is_token_valid(token, nxt_var_name, tuple(generated))
+                    
+                    value = self.vocab["id2token"][tokenid].split(SPECIAL_COL_SEP)[-1]
+                    z3val = map_to_z3var_value(nxt_var_name, value, self.constructor)
+                    isvalid = int(z3val.as_long()) in nxt_values
+                    #* Domain knowledge: Only check known ports.
+                    if 'Pt' in nxt_var_name \
+                        and 60_000 in nxt_values \
+                        and value not in cidds_ports_str:
+                        isvalid = True
+                        
                     if isvalid:
-                        valid_tokens.append(token)
+                        valid_tokens.append(tokenid)
+                        
                 if not valid_tokens:
+                    # if nxt_var_name == 'Flags':
+                    #     #! Let go the last col to see what happens.
+                    #     return col_valid_tokenids
                     self.num_invalid_tokens += 1
                     print(f"!!! No valid tokens found for {nxt_var_name}. \nGenerated:")
+                    print(f"{self.parent_node[batch_id]=}")
+                    print(f"{z3val=} not in {nxt_values=}")
                     pprint(self._generation_cache[batch_id]['generated'])
                     #* Mark this sample as invalid.
                     self._sample_validities[batch_id] = False
@@ -952,12 +1070,18 @@ class TabularSampler(REaLSampler):
             else:
                 #& Numeric variable with bounds.  
                 assert domain.bounds, f"{nxt_var_name} has no values or bounds in its domain."
-                lb, ub = self._solve_for_minmax(nxt_var_name, tuple(generated))
+                # lb, ub = self._solve_for_minmax(nxt_var_name, tuple(generated))
+                
+                child_nodes = list(self.trie.successors(self.parent_node[batch_id]))
+                assert len(child_nodes) == 1, f"More than one child node: {self.parent_node[batch_id]=}"
+                childid = next(self.trie.successors(self.parent_node[batch_id]))
+                assert 'bounds' in self.trie.nodes[childid], f"Child node {childid} has no bounds."
+                lb, ub = self.trie.nodes[childid]['bounds']
 
                 # print(f"\tLimits for {nxt_var_name}: {lb} ≤ {z3var} ≤ {ub}")
                 #TODO: Check if lb==ub -> fast forward generation.
                 #* Tokenize lb and ub in the same way as the generated values.
-                transform_data = self.col_transform_data[nxt_col_name]
+                transform_data = self.col_transform_data[nxt_var_name]
                 if transform_data['mx_sig'] < 0:
                     #* Integer
                     total_digits = transform_data['zfill']
@@ -1046,10 +1170,10 @@ class TabularSampler(REaLSampler):
             valid_tokens_lb = []
             if lb_str is not None:
                 lb_digit = lb_str[nxt_idx]
-                for token in col_valid_tokenids:
-                    value = self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1]
+                for tokenid in col_valid_tokenids:
+                    value = self.vocab["id2token"][tokenid].split(SPECIAL_COL_SEP)[-1]
                     if value >= lb_digit:
-                        valid_tokens_lb.append(token)
+                        valid_tokens_lb.append(tokenid)
                     else:
                         invalid_values.append(value)
             if valid_tokens_lb:
@@ -1058,10 +1182,10 @@ class TabularSampler(REaLSampler):
             valid_tokens = []
             if ub_str is not None:
                 ub_digit = ub_str[nxt_idx]
-                for token in col_valid_tokenids:
-                    value = self.vocab["id2token"][token].split(SPECIAL_COL_SEP)[-1]
+                for tokenid in col_valid_tokenids:
+                    value = self.vocab["id2token"][tokenid].split(SPECIAL_COL_SEP)[-1]
                     if value <= ub_digit:
-                        valid_tokens.append(token)
+                        valid_tokens.append(tokenid)
                     else:
                         invalid_values.append(value)
             else:
@@ -1137,7 +1261,7 @@ class TabularSampler(REaLSampler):
                 [self.vocab["token2id"][SpecialTokens.BOS] for _ in range(1)]
             ).unsqueeze(0)
         else:
-            #? Not sure what this is for.
+            #* Processing the prompt/instruction/prefix input.
             generated = self._process_seed_input(seed_input=seed_input)
 
         generated = generated.to(self.model.device)
@@ -1166,6 +1290,7 @@ class TabularSampler(REaLSampler):
 
             while num_generated < n_samples:
                 self._sample_validities = [True for _ in range(gen_batch)]
+                self.parent_node = ['root' for _ in range(gen_batch)]
                 
                 # https://huggingface.co/docs/transformers/internal/generation_utils
                 sample_outputs = self._generate(
@@ -1219,11 +1344,10 @@ class TabularSampler(REaLSampler):
                             #     assignment[var] = value
                             
                             #* CIC
-                            for key in sample.keys():
-                                if 'ID' in key or 'IP' in key: 
+                            for var in sample.keys():
+                                if 'ID' in var or 'IP' in var: 
                                     continue
-                                value = sample[key]
-                                var = to_big_camelcase(key, sep='_')
+                                value = sample[var]
                                 assignment[var] = value
                             
                             for rule in rules:
@@ -1236,7 +1360,7 @@ class TabularSampler(REaLSampler):
                         print(f"\nRemoved {len(violated_rules)}/{len(synth_sample)} samples that violated the rules.")
                         synth_sample = synth_sample.drop(violated_rules)
                     else:
-                        print(f"(Batch) Generated {len(invalid_sample_idxes)}/{len(synth_sample)} invalid samples.")
+                        print(f"\n(Batch) Generated {len(invalid_sample_idxes)}/{len(synth_sample)} invalid samples.")
                         synth_sample = synth_sample.drop(invalid_sample_idxes)
                     
                     empty_limit = continuous_empty_limit
