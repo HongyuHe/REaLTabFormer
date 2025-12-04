@@ -18,72 +18,72 @@ NUMERIC_NA_TOKEN = "@"
 INVALID_NUMS_RE = r"[^\-.0-9]"
 
 #******************** CIDDS-001 Domain Knowledge begins ********************
-#? Should port be a categorical variable? Sometimes we need range values (i.e., application and dynamic ports).
-cidds_categorical = ['Flags', 'Proto', 'SrcIpAddr', 'DstIpAddr'] + ['SrcPt', 'DstPt']
-cidds_numerical = ['Packets', 'Bytes', 'Flows', 'Duration']
-cidds_ips = ['private_p2p', 'private_broadcast', 'private_any', 'public_p2p', 'dns']
-cidds_ports = [0, 3, 8, 11, 22, 25, 
-            #    23, #* Telnet
-            #    8000, #* Seafile Server
-               53, 67, 68, 80, 123, 137, 138, 443, 8080]
+# #? Should port be a categorical variable? Sometimes we need range values (i.e., application and dynamic ports).
+# cidds_categorical = ['Flags', 'Proto', 'SrcIpAddr', 'DstIpAddr'] + ['SrcPt', 'DstPt']
+# cidds_numerical = ['Packets', 'Bytes', 'Flows', 'Duration']
+# cidds_ips = ['private_p2p', 'private_broadcast', 'private_any', 'public_p2p', 'dns']
+# cidds_ports = [0, 3, 8, 11, 22, 25, 
+#             #    23, #* Telnet
+#             #    8000, #* Seafile Server
+#                53, 67, 68, 80, 123, 137, 138, 443, 8080]
 
-#* Map strings to integers
-cidds_ip_conversion = bidict({ip: i for i, ip in enumerate(cidds_ips)})
-cidds_flags_conversion = bidict({flag: i for i, flag in enumerate(['noflags', 'flags'])})
-#TODO: Change the mapping to standard NetFlow codes: 
-# https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
-cidds_proto_conversion = bidict({proto: i for i, proto in enumerate(['TCP', 'UDP', 'ICMP', 'IGMP'])})
-cidds_conversions = {
-    'ip': cidds_ip_conversion,
-    'flags': cidds_flags_conversion,
-    'proto': cidds_proto_conversion
-}
-cidds_constants = {
-	'ip': list(cidds_conversions['ip'].values()),
-	'port': cidds_ports,
-	'packet': [42, 64, 65_535], #* MTU
-    'bytes': [1],
-}
+# #* Map strings to integers
+# cidds_ip_conversion = bidict({ip: i for i, ip in enumerate(cidds_ips)})
+# cidds_flags_conversion = bidict({flag: i for i, flag in enumerate(['noflags', 'flags'])})
+# #TODO: Change the mapping to standard NetFlow codes: 
+# # https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+# cidds_proto_conversion = bidict({proto: i for i, proto in enumerate(['TCP', 'UDP', 'ICMP', 'IGMP'])})
+# cidds_conversions = {
+#     'ip': cidds_ip_conversion,
+#     'flags': cidds_flags_conversion,
+#     'proto': cidds_proto_conversion
+# }
+# cidds_constants = {
+# 	'ip': list(cidds_conversions['ip'].values()),
+# 	'port': cidds_ports,
+# 	'packet': [42, 64, 65_535], #* MTU
+#     'bytes': [1],
+# }
 
-def cidds_proto_map(proto: str):
-	return cidds_proto_conversion[proto]
+# def cidds_proto_map(proto: str):
+# 	return cidds_proto_conversion[proto]
 
-def cidds_ip_map(ip: str):
-    new_ip = ''
-    if ip.startswith('192.168.'):
-        new_ip += 'private_'
-    else:        
-        new_ip += 'public_'
-    if '.255' in ip:
-        new_ip += 'broadcast'
-    else:
-        new_ip += 'p2p'
+# def cidds_ip_map(ip: str):
+#     new_ip = ''
+#     if ip.startswith('192.168.'):
+#         new_ip += 'private_'
+#     else:        
+#         new_ip += 'public_'
+#     if '.255' in ip:
+#         new_ip += 'broadcast'
+#     else:
+#         new_ip += 'p2p'
     
-    if ip == '0.0.0.0':
-        new_ip = 'private_any'
-    elif ip == '255.255.255.255':
-        new_ip = 'private_broadcast'
-    elif ip == 'DNS':
-        new_ip = 'dns'
+#     if ip == '0.0.0.0':
+#         new_ip = 'private_any'
+#     elif ip == '255.255.255.255':
+#         new_ip = 'private_broadcast'
+#     elif ip == 'DNS':
+#         new_ip = 'dns'
     
-    return cidds_ip_conversion[new_ip]
+#     return cidds_ip_conversion[new_ip]
 
-def cidds_flag_map(flag: str):
-	#! Don't consider the specific 'Flags' values for now
-    new_flag = ''
-    if flag == '......':
-        new_flag = 'noflags'
-    else:
-        new_flag = 'flags'
+# def cidds_flag_map(flag: str):
+# 	#! Don't consider the specific 'Flags' values for now
+#     new_flag = ''
+#     if flag == '......':
+#         new_flag = 'noflags'
+#     else:
+#         new_flag = 'flags'
     
-    return cidds_flags_conversion[new_flag]
+#     return cidds_flags_conversion[new_flag]
 #******************** CIDDS-001 Domain Knowledge ends ********************
 
 
-def to_big_camelcase(string: str, sep=' ') -> str:
-    words = string.split(sep)
-    return ''.join(word.capitalize() for word in words) \
-        if len(words) > 1 else string.capitalize()
+# def to_big_camelcase(string: str, sep=' ') -> str:
+#     words = string.split(sep)
+#     return ''.join(word.capitalize() for word in words) \
+#         if len(words) > 1 else string.capitalize()
 
 @dataclass(frozen=True)
 class TabularArtefact:
@@ -531,8 +531,14 @@ def process_data(
 
     # Rename the columns to encode the original order by adding a suffix of increasing
     # integer values.
-    num_cols = len(str(len(df.columns)))
+    #BUG: Fixed using seed input columns instead of that in the training data. 
+    #! --- This causes vocab mismatch
+    # num_cols = len(str(len(df.columns)))
+    num_cols = len(str(col_transform_data['num_cols']))
+    # print(f"{df.columns=}")
+    # print(f"{num_cols=}")
     col_idx = {col: f"{str(i).zfill(num_cols)}" for i, col in enumerate(df.columns)}
+    # print(f"Column indices: {col_idx}")
 
     # Create a dataframe that will hold the processed data
     processed_series = []

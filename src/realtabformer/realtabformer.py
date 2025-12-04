@@ -1255,6 +1255,7 @@ class REaLTabFormer:
                 continuous_empty_limit=continuous_empty_limit,
                 suppress_tokens=suppress_tokens,
                 forced_decoder_ids=forced_decoder_ids,
+                numeric_nparts=self.numeric_nparts,
                 **generate_kwargs,
             )
 
@@ -1311,16 +1312,19 @@ class REaLTabFormer:
 
         return synth_df
 
-    def predict(
+    def complete(
         self,
         data: pd.DataFrame,
-        target_col: str,
+        target_col: str = None,
         target_pos_val: Any = None,
         batch: int = 32,
-        obs_sample: int = 30,
+        samples_per_output: int = 30,
         fillunk: bool = True,
         device: str = "cuda",
         disable_progress_bar: bool = True,
+        
+        dataset: str = 'metadc',
+        validate: bool = False,
         **generate_kwargs,
     ) -> pd.Series:
         """
@@ -1333,7 +1337,7 @@ class REaLTabFormer:
               classification. This is produces a one-to-many prediction relative to
               `target_pos_val` for targets that are multi-categorical.
             batch: The batch size to use when making predictions.
-            obs_sample: The number of observations to sample from the data when making predictions.
+            samples_per_output: The number of observations to sample from the data when making predictions.
             fillunk: If True, the function will fill any missing values in the data before making
               predictions. Fill unknown tokens with the mode of the batch in the given step.
             device: The device to use for prediction. Can be either "cpu" or "cuda".
@@ -1358,7 +1362,9 @@ class REaLTabFormer:
         # assert self.tabular_col_size is not None
         # assert self.col_transform_data is not None
 
-        tabular_sampler = TabularSampler.sampler_from_model(self, device=device)
+        tabular_sampler = TabularSampler.sampler_from_model(
+            rtf_model=self, dataset=dataset, device=device
+        )
 
         # TabularSampler(
         #     model_type=self.model_type,
@@ -1377,15 +1383,18 @@ class REaLTabFormer:
         #     device=device,
         # )
 
-        return tabular_sampler.predict(
+        return tabular_sampler.complete(
             data=data,
             target_col=target_col,
             target_pos_val=target_pos_val,
             batch=batch,
-            obs_sample=obs_sample,
+            samples_per_output=samples_per_output,
             fillunk=fillunk,
             device=device,
             disable_progress_bar=disable_progress_bar,
+            
+            numeric_nparts=self.numeric_nparts,
+            validate=validate,
             **generate_kwargs,
         )
 
